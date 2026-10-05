@@ -123,6 +123,38 @@ def test_concurrent_duplicate_submissions():
     assert _best(1).stars == r["stars"]
 
 
+def test_same_submission_id_scoped_per_level():
+    """幂等键作用域仅限本关：不同关卡复用同一键是各自独立的提交，成绩不串关。"""
+    r1 = _run_level1()
+    req = api.ScoreRequest(level_id=1, run_id=r1["run_id"], submission_id="shared")
+    a = api.save_score(req)
+    # 第 2 关复用同一幂等键（带独立的执行档案），应作为新提交受理
+    r2 = api.run(api.SimRequest(level_id=2, actions=[
+        api.Action(type="burn", angle=90.0, dv=0.0047)]))
+    b = api.save_score(api.ScoreRequest(
+        level_id=2, run_id=r2["run_id"], submission_id="shared"))
+    assert a["duplicated"] is False and b["duplicated"] is False
+    assert a["record_id"] != b["record_id"]
+    assert a["level_id"] == 1 and b["level_id"] == 2
+    # 各关重复提交仍幂等，返回本关那条
+    assert api.save_score(req)["record_id"] == a["record_id"]
+    b2 = api.save_score(api.ScoreRequest(
+        level_id=2, run_id=r2["run_id"], submission_id="shared"))
+    assert b2["duplicated"] is True and b2["record_id"] == b["record_id"]
+    db = SessionLocal()
+    rows = db.query(ScoreRecord).order_by(ScoreRecord.id).all()
+    assert [(x.level_id, x.submission_id) for x in rows] == [(1, "shared"), (2, "shared")]
+    db.close()
+    # 最佳成绩各归各关（不串关）
+    assert _best(1).stars == r1["stars"]
+    assert _best(2).stars == r2["stars"]
+    # 回放也锚定本关的执行档案
+    d1 = api.record_detail(a["record_id"])
+    d2 = api.record_detail(b["record_id"])
+    assert d1["level_id"] == 1 and d1["run_uid"] == r1["run_id"]
+    assert d2["level_id"] == 2 and d2["run_uid"] == r2["run_id"]
+
+
 def test_concurrent_mixed_submissions_best_monotonic():
     """并发提交不同成绩：全部落库，最佳汇总收敛到最高星且不被回退。"""
 

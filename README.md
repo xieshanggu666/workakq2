@@ -22,7 +22,7 @@
 | --- | --- |
 | 后端 | Python 3.10 + FastAPI + SQLAlchemy(SQLite) |
 | 前端 | Vue 3（静态引入）+ Canvas 2D 手绘渲染 |
-| 测试 | pytest（物理守恒/关卡可解性/评分规则/成绩记录与并发幂等/挑战发布/审核/申诉复核与回滚，54 项） |
+| 测试 | pytest（物理守恒/关卡可解性/评分规则/成绩记录与并发幂等/挑战发布/审核/申诉复核与回滚，57 项） |
 
 ## 快速开始
 
@@ -116,7 +116,7 @@ slingshot_game/
 │       └── challenges.py     # 社区挑战（版本化/幂等提交/两级审核/申诉复核/撤销回滚/事件档案）
 ├── static/                   # Vue3 + Canvas 前端
 ├── scripts/calibrate.py      # 关卡可解性校准工具（开发用）
-├── tests/                    # pytest（42 项）
+├── tests/                    # pytest（57 项）
 ├── package.json              # npm run dev 一键启动
 └── requirements.txt
 ```

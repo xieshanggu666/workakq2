@@ -46,11 +46,18 @@ class ScoreRecord(Base):
 
     submission_id 是客户端生成的幂等键：同一提交（双击/重试/多标签页）
     重复到达时只落库一次，返回首个结果。
+
+    幂等作用域限定在同一关卡（level_id, submission_id）复合唯一：
+    不同关卡复用同一个幂等键是彼此独立的提交，成绩不会串到别的关卡。
     """
     __tablename__ = "score_record"
+    __table_args__ = (
+        UniqueConstraint("level_id", "submission_id",
+                         name="uq_score_level_submission"),
+    )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    submission_id = Column(String(64), nullable=False, unique=True, index=True)
+    submission_id = Column(String(64), nullable=False)
     run_id = Column(Integer, ForeignKey("run_record.id"), nullable=True, index=True)
     level_id = Column(Integer, nullable=False, index=True)
     stars = Column(Integer, nullable=False, default=0)
@@ -120,14 +127,21 @@ class ChallengeRun(Base):
 class ChallengeSubmission(Base):
     """挑战成绩提交记录：幂等键去重 + 审核状态机。
 
-    submission_id 是客户端生成的幂等键（双击/重试/多标签页只结算一次）。
+    submission_id 是客户端生成的幂等键（双击/重试/多标签页只结算一次），
+    其作用域限定在同一挑战（challenge_id, submission_id）复合唯一：
+    不同挑战复用同一幂等键属于各自独立的提交，成绩不会串到别的挑战，
+    审核状态/排行榜/轨迹回放始终锚定提交时指定的挑战。
     审核状态 pending → approved/rejected；只有 approved 的成绩才进入排行榜、
     开放轨迹回放，并计入关卡解锁条件。
     """
     __tablename__ = "challenge_submission"
+    __table_args__ = (
+        UniqueConstraint("challenge_id", "submission_id",
+                         name="uq_chsub_challenge_submission"),
+    )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    submission_id = Column(String(64), nullable=False, unique=True, index=True)
+    submission_id = Column(String(64), nullable=False)
     run_id = Column(Integer, ForeignKey("challenge_run.id"), nullable=False, index=True)
     challenge_id = Column(Integer, nullable=False, index=True)
     version = Column(Integer, nullable=False)

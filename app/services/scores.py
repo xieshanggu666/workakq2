@@ -5,6 +5,8 @@
   run_id 关联到它 —— 分数由服务端结算得出，且每条成绩都可溯源、可回放。
 - 提交幂等：客户端为每次发射生成 submission_id；重复提交（双击、网络重试、
   多标签页）命中唯一约束或查重分支，只保留首个结果，不重复刷新最佳成绩。
+  幂等键作用域仅限同一关卡（level_id, submission_id）：不同关卡复用同一键
+  是各自独立的提交，成绩不会串到别的关卡。
 - 并发安全：模块级锁串行化"查重 → 插入 → 更新最佳"临界区（SQLite 单写者），
   submission_id 唯一约束作为兜底；最佳汇总只单调变优，不会被并发写回退。
 - 旧存档兼容：level_score 汇总表结构不变；旧客户端不带 run_id/submission_id
@@ -97,14 +99,16 @@ def save_score(db, *, level_id: int, submission_id: Optional[str] = None,
                fuel_used: float = 0.0, elapsed_days: float = 0.0) -> dict:
     """落库一条成绩记录并刷新最佳汇总。
 
-    幂等：submission_id 已存在时直接返回首个提交的结果（duplicated=True），
-    不重复落库、不重复刷新最佳成绩。
+    幂等：同一关卡下 submission_id 已存在时直接返回首个提交的结果
+    （duplicated=True），不重复落库、不重复刷新最佳成绩。幂等键作用域
+    仅限本关卡，不同关卡复用同一键互不影响，成绩不会串关。
     """
     with _SAVE_LOCK:
-        # 1) 幂等重放：同一提交已受理过 → 返回首个结果
+        # 1) 幂等重放：本关卡下同一提交已受理过 → 返回首个结果
         if submission_id:
             dup = (db.query(ScoreRecord)
-                     .filter(ScoreRecord.submission_id == submission_id)
+                     .filter(ScoreRecord.submission_id == submission_id,
+                             ScoreRecord.level_id == level_id)
                      .first())
             if dup is not None:
                 return _duplicated_response(db, dup, level_id)
@@ -124,7 +128,7 @@ def save_score(db, *, level_id: int, submission_id: Optional[str] = None,
             source = "run"
         stars = int(stars or 0)
 
-        # 3) 落库成绩记录（唯一约束兜底并发重复）
+        # 3) 落库成绩记录（(level_id, submission_id) 唯一约束兜底并发重复）
         rec = ScoreRecord(
             submission_id=submission_id or uuid.uuid4().hex,
             run_id=run.id if run else None,
@@ -141,9 +145,12 @@ def save_score(db, *, level_id: int, submission_id: Optional[str] = None,
         except IntegrityError:
             db.rollback()
             dup = (db.query(ScoreRecord)
-                     .filter(ScoreRecord.submission_id == rec.submission_id)
+                     .filter(ScoreRecord.submission_id == rec.submission_id,
+                             ScoreRecord.level_id == level_id)
                      .first())
-            return _duplicated_response(db, dup, level_id)
+            if dup is not None:
+                return _duplicated_response(db, dup, level_id)
+            raise
 
         # 4) 单调刷新最佳汇总并提交
         improved = _apply_best(db, level_id, stars, fuel_used, elapsed_days)

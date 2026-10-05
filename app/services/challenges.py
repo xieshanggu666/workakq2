@@ -491,14 +491,17 @@ def submit(db, *, challenge_id: int, run_id: str, submission_id: Optional[str],
            player: Optional[str]) -> dict:
     """落库一条挑战成绩（默认待审核）。
 
-    幂等：submission_id 已存在时直接返回首个提交的结果（duplicated=True），
-    不重复落库、不重复进入审核队列。
+    幂等：同一挑战下 submission_id 已存在时直接返回首个提交的结果
+    （duplicated=True），不重复落库、不重复进入审核队列。幂等键的作用域
+    仅限本挑战——不同挑战复用同一键是彼此独立的提交，不会串成绩；
+    审核状态、排行榜与轨迹回放始终锚定提交路径上的这个挑战。
     """
     with _LOCK:
-        # 1) 幂等重放：同一提交已受理过 → 返回首个结果
+        # 1) 幂等重放：本挑战下同一提交已受理过 → 返回首个结果
         if submission_id:
             dup = (db.query(ChallengeSubmission)
-                     .filter(ChallengeSubmission.submission_id == submission_id)
+                     .filter(ChallengeSubmission.submission_id == submission_id,
+                             ChallengeSubmission.challenge_id == challenge_id)
                      .first())
             if dup is not None:
                 return _submitted_response(dup, duplicated=True)
@@ -512,7 +515,7 @@ def submit(db, *, challenge_id: int, run_id: str, submission_id: Optional[str],
         if run.challenge_id != challenge_id:
             raise RunChallengeMismatch("执行记录与挑战不匹配")
 
-        # 3) 落库成绩记录（唯一约束兜底并发重复）
+        # 3) 落库成绩记录（(challenge_id, submission_id) 唯一约束兜底并发重复）
         rec = ChallengeSubmission(
             submission_id=submission_id or uuid.uuid4().hex,
             run_id=run.id,
@@ -531,9 +534,12 @@ def submit(db, *, challenge_id: int, run_id: str, submission_id: Optional[str],
         except IntegrityError:
             db.rollback()
             dup = (db.query(ChallengeSubmission)
-                     .filter(ChallengeSubmission.submission_id == rec.submission_id)
+                     .filter(ChallengeSubmission.submission_id == rec.submission_id,
+                             ChallengeSubmission.challenge_id == challenge_id)
                      .first())
-            return _submitted_response(dup, duplicated=True)
+            if dup is not None:
+                return _submitted_response(dup, duplicated=True)
+            raise
         _add_event(db, rec, kind=EV_SUBMIT, actor=rec.player,
                    actor_role="player",
                    detail={"submission_id": rec.submission_id,
@@ -545,8 +551,95 @@ def submit(db, *, challenge_id: int, run_id: str, submission_id: Optional[str],
 
 # ---------- 审核权限 / 历史兼容 ----------
 
+def _index_columns(conn, table: str):
+    """表上每个索引 → 其覆盖列（不含 rowid 伪列），用于识别旧的全局唯一索引。
+
+    表名为模块内固定常量（非外部输入），PRAGMA 不支持参数绑定，直接拼接。
+    """
+    out = {}
+    for row in conn.execute(
+            f"PRAGMA index_list({table})").fetchall():
+        idx = row[1]
+        cols = [r[2] for r in conn.execute(
+            f'PRAGMA index_info("{idx}")').fetchall()]
+        out[idx] = cols
+    return out
+
+
+def _rebuild_scoped_unique(conn, table: str, scope_col: str,
+                           constraint_name: str) -> bool:
+    """把 (submission_id) 全局唯一约束重建为 (scope_col, submission_id) 复合唯一。
+
+    旧库幂等键只有全局唯一：不同挑战/关卡复用同一键会把成绩串到别处。
+    SQLite 不能直接改约束，按 12 步表重建流程保留全部数据与既有索引/外键。
+    返回是否执行了重建。
+    """
+    indexes = _index_columns(conn, table)
+    # 已是复合唯一的新库：无需迁移
+    for cols in indexes.values():
+        if cols == [scope_col, "submission_id"]:
+            return False
+    # 幂等键上没有单列唯一索引（非约束场景）也不处理
+    if not any(cols == ["submission_id"] for cols in indexes.values()):
+        return False
+
+    cols_info = conn.execute(
+        f"PRAGMA table_info({table})").fetchall()
+    col_defs = [f"{r[1]} {r[2]}" + (" NOT NULL" if r[3] else "")
+                + (f" DEFAULT {r[4]}" if r[4] is not None else "")
+                + (" PRIMARY KEY" if r[5] else "")
+                for r in cols_info]
+    col_names = ", ".join(r[1] for r in cols_info)
+    # 保留外键定义（仅 challenge_run / run_record 关联，按表名固定列出）
+    fk = ""
+    if table == "challenge_submission":
+        fk = ", FOREIGN KEY(run_id) REFERENCES challenge_run (id)"
+    elif table == "score_record":
+        fk = ", FOREIGN KEY(run_id) REFERENCES run_record (id)"
+    # 重建既有二级索引（submission_id 上的旧自动唯一索引除外）
+    keep_index_names = []
+    keep_indexes = []
+    for idx, cols in indexes.items():
+        if idx.startswith("sqlite_autoindex"):
+            continue
+        if cols == ["submission_id"]:
+            continue
+        keep_index_names.append(idx)
+        keep_indexes.append(
+            f'CREATE INDEX "{idx}" ON {table} ({", ".join(cols)})')
+
+    conn.execute("PRAGMA foreign_keys=off")
+    try:
+        conn.execute("BEGIN")
+        # RENAME 会把二级索引一并带到旧表名下且名字不变，先删除以避免重建时重名；
+        # 自动唯一索引（submission_id 旧约束）随 DROP 旧表清除。
+        for idx in keep_index_names:
+            conn.execute(f'DROP INDEX "{idx}"')
+        conn.execute(f"ALTER TABLE {table} RENAME TO {table}_old_uk")
+        conn.execute(
+            f"CREATE TABLE {table} ({', '.join(col_defs)}, "
+            f"CONSTRAINT {constraint_name} UNIQUE ({scope_col}, submission_id)"
+            f"{fk})")
+        conn.execute(
+            f"INSERT INTO {table} ({col_names}) SELECT {col_names} "
+            f"FROM {table}_old_uk")
+        for stmt in keep_indexes:
+            conn.execute(stmt)
+        conn.execute(f"DROP TABLE {table}_old_uk")
+        conn.execute("COMMIT")
+    finally:
+        conn.execute("PRAGMA foreign_keys=on")
+    return True
+
+
 def _sqlite_migrate(db) -> None:
-    """对旧库做增量列迁移（SQLite ALTER TABLE ADD COLUMN，幂等）。"""
+    """对旧库做增量迁移（SQLite ALTER/表重建，全程幂等）。
+
+    - challenge_submission 补 reviewed_by 列（历史库兼容）；
+    - 幂等键唯一约束由全局 (submission_id) 收窄为作用域复合唯一：
+      challenge_submission(challenge_id, submission_id)、
+      score_record(level_id, submission_id)，避免不同挑战/关卡复用同一键串成绩。
+    """
     bind = db.get_bind()
     try:
         url = bind.url
@@ -555,16 +648,35 @@ def _sqlite_migrate(db) -> None:
     if url is None or not str(url).startswith("sqlite"):
         return
     path = url.database
+    if not path or path == ":memory:":
+        return
     conn = sqlite3.connect(path)
+    changed = False
     try:
-        cols = {r[1] for r in conn.execute(
-            "PRAGMA table_info(challenge_submission)").fetchall()}
-        if cols and "reviewed_by" not in cols:
-            conn.execute(
-                "ALTER TABLE challenge_submission ADD COLUMN reviewed_by VARCHAR(24)")
-            conn.commit()
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if "challenge_submission" in tables:
+            cols = {r[1] for r in conn.execute(
+                "PRAGMA table_info(challenge_submission)").fetchall()}
+            if cols and "reviewed_by" not in cols:
+                conn.execute(
+                    "ALTER TABLE challenge_submission ADD COLUMN reviewed_by VARCHAR(24)")
+                conn.commit()
+            changed |= _rebuild_scoped_unique(
+                conn, "challenge_submission", "challenge_id",
+                "uq_chsub_challenge_submission")
+        if "score_record" in tables:
+            changed |= _rebuild_scoped_unique(
+                conn, "score_record", "level_id",
+                "uq_score_level_submission")
+        conn.commit()
     finally:
         conn.close()
+    if changed:
+        # 表重建后，池内已存在的连接仍持有旧表（DROP/RENAME 前）的 schema 缓存，
+        # 让其全部失效；调用方的 session 也回到干净状态再重新取连接。
+        db.rollback()
+        bind.dispose()
 
 
 def _seed_reviewers(db) -> None:

@@ -246,6 +246,86 @@ def test_submit_concurrent_duplicates():
     db.close()
 
 
+def test_same_submission_id_scoped_per_challenge():
+    """幂等键作用域仅限本挑战：不同挑战复用同一键是各自独立的提交，
+    成绩/审核/排行榜/回放都锚定各自的挑战，不会串到别处。"""
+    a = _create(title="挑战A")
+    b = _create(title="挑战B")
+    ra = _run(a["id"])
+    rb = _run(b["id"])
+    sa = _submit(a["id"], ra["run_id"], "shared-key")
+    sb = _submit(b["id"], rb["run_id"], "shared-key")
+    # 两条独立成绩，分别归属各自挑战
+    assert sa["record_id"] != sb["record_id"]
+    assert sa["challenge_id"] == a["id"] and sb["challenge_id"] == b["id"]
+    assert sa["duplicated"] is False and sb["duplicated"] is False
+    db = SessionLocal()
+    recs = db.query(ChallengeSubmission).order_by(ChallengeSubmission.id).all()
+    assert len(recs) == 2
+    assert {r.challenge_id for r in recs} == {a["id"], b["id"]}
+    db.close()
+
+    # 各自重复提交仍幂等，且返回的是本挑战的那条
+    sa2 = _submit(a["id"], ra["run_id"], "shared-key")
+    sb2 = _submit(b["id"], rb["run_id"], "shared-key")
+    assert sa2["duplicated"] is True and sa2["record_id"] == sa["record_id"]
+    assert sa2["challenge_id"] == a["id"]
+    assert sb2["duplicated"] is True and sb2["record_id"] == sb["record_id"]
+    assert sb2["challenge_id"] == b["id"]
+
+    # 审核 A 的成绩：只影响 A 的排行榜/回放，B 的成绩保持待审
+    _approve(sa["record_id"])
+    assert len(ch_api.get_leaderboard(a["id"])["entries"]) == 1
+    assert ch_api.get_leaderboard(b["id"])["entries"] == []
+    da = ch_api.get_submission(sa["record_id"])
+    assert da["replayable"] is True and da["challenge_id"] == a["id"]
+    assert da["trajectory"]  # A 开放回放
+    db_detail = ch_api.get_submission(sb["record_id"])
+    assert db_detail["replayable"] is False and "trajectory" not in db_detail
+    # A 的回放轨迹来自 A 的执行档案，而不是 B 的
+    assert da["run_uid"] == ra["run_id"] != rb["run_id"]
+
+    # 通过 B 后双方各在各的排行榜上
+    _approve(sb["record_id"])
+    entries_a = ch_api.get_leaderboard(a["id"])["entries"]
+    entries_b = ch_api.get_leaderboard(b["id"])["entries"]
+    assert [e["record_id"] for e in entries_a] == [sa["record_id"]]
+    assert [e["record_id"] for e in entries_b] == [sb["record_id"]]
+
+
+def test_same_submission_id_concurrent_across_challenges():
+    """两个挑战并发提交同一个幂等键：各自落库一条，不互相吞掉。"""
+    a = _create(title="挑战A")
+    b = _create(title="挑战B")
+    ra = _run(a["id"])
+    rb = _run(b["id"])
+    results = []
+
+    def worker(cid, run_id):
+        with SessionLocal() as db:
+            results.append(ch_svc.submit(
+                db, challenge_id=cid, run_id=run_id,
+                submission_id="race-shared", player="飞行员"))
+
+    threads = []
+    for _ in range(4):
+        threads.append(threading.Thread(target=worker, args=(a["id"], ra["run_id"])))
+        threads.append(threading.Thread(target=worker, args=(b["id"], rb["run_id"])))
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    by_challenge = {a["id"]: set(), b["id"]: set()}
+    for r in results:
+        by_challenge[r["challenge_id"]].add(r["record_id"])
+    assert len(by_challenge[a["id"]]) == 1
+    assert len(by_challenge[b["id"]]) == 1
+    assert by_challenge[a["id"]] != by_challenge[b["id"]]
+    db = SessionLocal()
+    assert db.query(ChallengeSubmission).count() == 2
+    db.close()
+
+
 def test_submit_rejects_bad_run():
     d = _create()
     with pytest.raises(HTTPException) as e1:
