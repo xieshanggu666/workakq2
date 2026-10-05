@@ -1,6 +1,6 @@
 import time
 
-from sqlalchemy import (Column, Float, ForeignKey, Integer, String, Text,
+from sqlalchemy import (Column, Float, ForeignKey, Index, Integer, String, Text,
                         UniqueConstraint)
 
 from app.core.database import Base
@@ -45,12 +45,15 @@ class ScoreRecord(Base):
     """一条成绩提交记录。
 
     submission_id 是客户端生成的幂等键：同一提交（双击/重试/多标签页）
-    重复到达时只落库一次，返回首个结果。
+    重复到达时只落库一次，返回首个结果。幂等键作用域为单个关卡——
+    不同关卡各自独立，跨关卡复用同键不会串成绩。
     """
     __tablename__ = "score_record"
+    __table_args__ = (Index("uq_level_submission", "level_id", "submission_id",
+                            unique=True),)
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    submission_id = Column(String(64), nullable=False, unique=True, index=True)
+    submission_id = Column(String(64), nullable=False, index=True)
     run_id = Column(Integer, ForeignKey("run_record.id"), nullable=True, index=True)
     level_id = Column(Integer, nullable=False, index=True)
     stars = Column(Integer, nullable=False, default=0)
@@ -120,14 +123,17 @@ class ChallengeRun(Base):
 class ChallengeSubmission(Base):
     """挑战成绩提交记录：幂等键去重 + 审核状态机。
 
-    submission_id 是客户端生成的幂等键（双击/重试/多标签页只结算一次）。
-    审核状态 pending → approved/rejected；只有 approved 的成绩才进入排行榜、
-    开放轨迹回放，并计入关卡解锁条件。
+    submission_id 是客户端生成的幂等键（双击/重试/多标签页只结算一次），
+    作用域为单个挑战：不同挑战各自独立，跨挑战复用同键不会串成绩、
+    串审核队列、串排行榜与回放。审核状态 pending → approved/rejected；
+    只有 approved 的成绩才进入排行榜、开放轨迹回放，并计入关卡解锁条件。
     """
     __tablename__ = "challenge_submission"
+    __table_args__ = (Index("uq_challenge_submission",
+                            "challenge_id", "submission_id", unique=True),)
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    submission_id = Column(String(64), nullable=False, unique=True, index=True)
+    submission_id = Column(String(64), nullable=False, index=True)
     run_id = Column(Integer, ForeignKey("challenge_run.id"), nullable=False, index=True)
     challenge_id = Column(Integer, nullable=False, index=True)
     version = Column(Integer, nullable=False)
@@ -163,14 +169,16 @@ class Reviewer(Base):
 class ChallengeAppeal(Base):
     """玩家申诉单：对已驳回(rejected)/已撤销(revoked)成绩发起的复核请求。
 
-    appeal_uid 为客户端生成的幂等键（双击/重试只受理一次）；每条成绩最多
-    MAX_APPEAL_ROUNDS 轮、同时仅一条待裁决申诉。申诉期间成绩回到 pending
-    进入复核队列；复核维持(uphold)回到 from_status，推翻(overturn)改判通过。
+    appeal_uid 为客户端生成的幂等键（双击/重试只受理一次），作用域为单条成绩；
+    每条成绩最多 MAX_APPEAL_ROUNDS 轮、同时仅一条待裁决申诉。申诉期间成绩回到
+    pending 进入复核队列；复核维持(uphold)回到 from_status，推翻(overturn)改判通过。
     """
     __tablename__ = "challenge_appeal"
+    __table_args__ = (Index("uq_submission_appeal",
+                            "submission_id", "appeal_uid", unique=True),)
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    appeal_uid = Column(String(64), nullable=False, unique=True, index=True)
+    appeal_uid = Column(String(64), nullable=False, index=True)
     submission_id = Column(Integer, ForeignKey("challenge_submission.id"),
                            nullable=False, index=True)
     round = Column(Integer, nullable=False, default=1)  # 第几轮申诉（1、2）

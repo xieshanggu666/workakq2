@@ -5,6 +5,8 @@
   run_id 关联到它 —— 分数由服务端结算得出，且每条成绩都可溯源、可回放。
 - 提交幂等：客户端为每次发射生成 submission_id；重复提交（双击、网络重试、
   多标签页）命中唯一约束或查重分支，只保留首个结果，不重复刷新最佳成绩。
+  幂等键的作用域是单个关卡（复合唯一约束 (level_id, submission_id)）：
+  跨关卡复用同键各自独立落库，成绩不会串到别的关卡。
 - 并发安全：模块级锁串行化"查重 → 插入 → 更新最佳"临界区（SQLite 单写者），
   submission_id 唯一约束作为兜底；最佳汇总只单调变优，不会被并发写回退。
 - 旧存档兼容：level_score 汇总表结构不变；旧客户端不带 run_id/submission_id
@@ -32,6 +34,15 @@ class RunNotFound(KeyError):
 
 class RunLevelMismatch(ValueError):
     """执行档案与提交的关卡不一致。"""
+
+
+class IdempotencyConflict(ValueError):
+    """幂等键在同一关卡内已被另一条执行档案的提交占用（409）。
+
+    幂等键的作用域是"某关卡下的一次提交"：同键重放必须与首次提交指向
+    同一条执行档案；对另一条执行档案复用同键属客户端冲突，不能当作重放。
+    跨关卡复用同键互不影响（各自独立落库、刷新各自的最佳成绩）。
+    """
 
 
 def record_run(db, level_id: int, actions: List[dict], result: dict) -> RunRecord:
@@ -81,14 +92,14 @@ def _best_stars(db, level_id: int, fallback: int) -> int:
     return row.stars if row is not None else fallback
 
 
-def _duplicated_response(db, rec: Optional[ScoreRecord], level_id: int) -> dict:
+def _duplicated_response(db, rec: ScoreRecord) -> dict:
     return {
         "saved": True,
         "duplicated": True,
         "improved": False,
-        "record_id": rec.id if rec else None,
-        "level_id": level_id,
-        "stars": _best_stars(db, level_id, rec.stars if rec else 0),
+        "record_id": rec.id,
+        "level_id": rec.level_id,
+        "stars": _best_stars(db, rec.level_id, rec.stars),
     }
 
 
@@ -97,19 +108,14 @@ def save_score(db, *, level_id: int, submission_id: Optional[str] = None,
                fuel_used: float = 0.0, elapsed_days: float = 0.0) -> dict:
     """落库一条成绩记录并刷新最佳汇总。
 
-    幂等：submission_id 已存在时直接返回首个提交的结果（duplicated=True），
-    不重复落库、不重复刷新最佳成绩。
+    幂等：同一关卡内 submission_id 已存在（且关联同一条执行档案）时直接返回
+    首个提交的结果（duplicated=True），不重复落库、不重复刷新最佳成绩。
+    幂等键的作用域是"本关卡下的单次提交"——不同关卡复用同键互不影响
+    （各自独立落库、刷新各自的最佳成绩）；同关卡内同键却换了一条执行档案
+    则抛 IdempotencyConflict(409)。
     """
     with _SAVE_LOCK:
-        # 1) 幂等重放：同一提交已受理过 → 返回首个结果
-        if submission_id:
-            dup = (db.query(ScoreRecord)
-                     .filter(ScoreRecord.submission_id == submission_id)
-                     .first())
-            if dup is not None:
-                return _duplicated_response(db, dup, level_id)
-
-        # 2) 取值：优先关联执行档案（服务端结算，可溯源）；否则按旧版客户端字段
+        # 1) 取值：优先关联执行档案（服务端结算，可溯源）；否则按旧版客户端字段
         run = None
         source = "legacy"
         if run_id is not None:
@@ -123,6 +129,19 @@ def save_score(db, *, level_id: int, submission_id: Optional[str] = None,
             stars, fuel_used, elapsed_days = run.stars, run.fuel_used, run.elapsed_days
             source = "run"
         stars = int(stars or 0)
+
+        # 2) 幂等重放：同一关卡下同键（且同一条执行档案）→ 返回首个结果
+        if submission_id:
+            dup = (db.query(ScoreRecord)
+                     .filter(ScoreRecord.level_id == level_id,
+                             ScoreRecord.submission_id == submission_id)
+                     .first())
+            if dup is not None:
+                if run is not None and dup.run_id != run.id:
+                    raise IdempotencyConflict(
+                        "幂等键在本关已用于另一条飞行记录的提交，"
+                        "请为本次提交生成新的 submission_id")
+                return _duplicated_response(db, dup)
 
         # 3) 落库成绩记录（唯一约束兜底并发重复）
         rec = ScoreRecord(
@@ -140,10 +159,19 @@ def save_score(db, *, level_id: int, submission_id: Optional[str] = None,
             db.flush()
         except IntegrityError:
             db.rollback()
+            # 并发重放（双击/重试/多标签页同时到达）：以已落库的首条为准；
+            # 同关卡下键相同但执行档案不同 → 冲突，不能错返别的飞行记录
             dup = (db.query(ScoreRecord)
-                     .filter(ScoreRecord.submission_id == rec.submission_id)
+                     .filter(ScoreRecord.level_id == level_id,
+                             ScoreRecord.submission_id == rec.submission_id)
                      .first())
-            return _duplicated_response(db, dup, level_id)
+            if dup is None:
+                raise
+            if run is not None and dup.run_id != run.id:
+                raise IdempotencyConflict(
+                    "幂等键在本关已用于另一条飞行记录的提交，"
+                    "请为本次提交生成新的 submission_id")
+            return _duplicated_response(db, dup)
 
         # 4) 单调刷新最佳汇总并提交
         improved = _apply_best(db, level_id, stars, fuel_used, elapsed_days)

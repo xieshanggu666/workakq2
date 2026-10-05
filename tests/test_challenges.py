@@ -258,6 +258,83 @@ def test_submit_rejects_bad_run():
     assert e2.value.status_code == 400
 
 
+def test_same_idempotency_key_reused_another_challenge_is_independent():
+    """同一幂等键用于不同挑战：两次提交各自独立，成绩不串挑战。"""
+    a = _create(title="航线A")
+    b = _create(title="航线B")
+    ra = _run(a["id"])
+    rb = _run(b["id"])
+    sa = _submit(a["id"], ra["run_id"], "shared-key")
+    sb = _submit(b["id"], rb["run_id"], "shared-key")
+    assert sa["record_id"] != sb["record_id"]
+    assert sa["challenge_id"] == a["id"] and sb["challenge_id"] == b["id"]
+    db = SessionLocal()
+    assert db.query(ChallengeSubmission).count() == 2
+    rec_a = db.query(ChallengeSubmission).filter_by(id=sa["record_id"]).one()
+    rec_b = db.query(ChallengeSubmission).filter_by(id=sb["record_id"]).one()
+    assert rec_a.challenge_id == a["id"] and rec_b.challenge_id == b["id"]
+    db.close()
+
+    # 各自走审核：A 通过后只进 A 的排行榜、只回放 A 的轨迹；B 不受影响
+    _approve(sa["record_id"])
+    assert [e["record_id"] for e in ch_api.get_leaderboard(a["id"])["entries"]] == [sa["record_id"]]
+    assert ch_api.get_leaderboard(b["id"])["entries"] == []
+    da, db_detail = ch_api.get_submission(sa["record_id"]), ch_api.get_submission(sb["record_id"])
+    assert da["replayable"] and da["challenge_id"] == a["id"]
+    assert not db_detail["replayable"] and db_detail["challenge_id"] == b["id"]
+    # 同键对同挑战重放仍是幂等的
+    again = _submit(a["id"], ra["run_id"], "shared-key")
+    assert again["duplicated"] and again["record_id"] == sa["record_id"]
+    # B 审核通过后也独立上榜，且回放的是 B 自己的执行档案
+    _approve(sb["record_id"])
+    bb = ch_api.get_submission(sb["record_id"])
+    assert bb["replayable"] and bb["run_uid"] == rb["run_id"]
+    assert [e["record_id"] for e in ch_api.get_leaderboard(b["id"])["entries"]] == [sb["record_id"]]
+
+
+def test_same_key_same_challenge_different_run_conflicts():
+    """同挑战内同键换一条飞行记录 → 409，不能并成一条成绩。"""
+    d = _create()
+    r1 = _run(d["id"])
+    r2 = _run(d["id"])
+    _submit(d["id"], r1["run_id"], "k-1")
+    with pytest.raises(HTTPException) as e:
+        _submit(d["id"], r2["run_id"], "k-1")
+    assert e.value.status_code == 409
+    db = SessionLocal()
+    assert db.query(ChallengeSubmission).count() == 1  # 第二次未落库
+    db.close()
+
+
+def test_cross_challenge_same_key_concurrent_submissions():
+    """不同挑战用同一幂等键并发提交：各落各的，审核/排行榜/回放互不串。"""
+    a = _create(title="并发A")
+    b = _create(title="并发B")
+    ra, rb = _run(a["id"]), _run(b["id"])
+    results = {}
+
+    def worker(which):
+        cid, rid = (a["id"], ra["run_id"]) if which == "a" else (b["id"], rb["run_id"])
+        results[which] = _submit(cid, rid, "concurrent-shared-key")
+
+    threads = []
+    for which in ("a", "b"):
+        for _ in range(4):
+            threads.append(threading.Thread(target=worker, args=(which,)))
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    ids_a = {v["record_id"] for k, v in results.items() if k == "a"}
+    ids_b = {v["record_id"] for k, v in results.items() if k == "b"}
+    assert len(ids_a) == len(ids_b) == 1 and ids_a != ids_b
+    db = SessionLocal()
+    assert db.query(ChallengeSubmission).count() == 2
+    assert db.query(ChallengeSubmission).filter_by(challenge_id=a["id"]).count() == 1
+    assert db.query(ChallengeSubmission).filter_by(challenge_id=b["id"]).count() == 1
+    db.close()
+
+
 # ---------- 审核联动：排行榜 / 回放 / 解锁 ----------
 
 def test_review_gates_leaderboard_replay_and_unlock():
@@ -780,3 +857,97 @@ def test_legacy_reviewed_submissions_backfill_events():
         ChallengeReviewEvent.submission_id == rid).count()
     db.close()
     assert n == 1
+
+
+# ---------- 旧库迁移：幂等键作用域从全局改为"挑战 + 键" ----------
+
+def test_legacy_global_idempotency_key_migrates_to_challenge_scoped():
+    """旧库（submission_id 全局唯一）启动迁移后变为按挑战复合唯一：
+    数据保留、旧约束摘除，跨挑战可复用同键、同挑战仍去重。"""
+    import sqlite3
+    from app.core.config import DB_PATH
+
+    d = _create(title="迁移航线")
+    r = _run(d["id"])
+    s = _submit(d["id"], r["run_id"], "legacy-key")
+    rid = s["record_id"]
+    db = SessionLocal()
+    db.query(ChallengeReviewEvent).delete()
+    db.commit()
+    db.close()
+
+    conn = sqlite3.connect(DB_PATH)
+    # 用旧结构重建三张幂等表：单列 UNIQUE（落为 sqlite_autoindex）、无复合命名索引
+    conn.executescript("""
+ALTER TABLE challenge_submission RENAME TO _cs_old;
+CREATE TABLE challenge_submission (
+  id INTEGER PRIMARY KEY, submission_id VARCHAR(64) NOT NULL UNIQUE,
+  run_id INTEGER NOT NULL, challenge_id INTEGER NOT NULL, version INTEGER NOT NULL,
+  player VARCHAR(24), stars INTEGER, fuel_used FLOAT, elapsed_days FLOAT,
+  review_status VARCHAR(16), review_note VARCHAR(200),
+  reviewed_by VARCHAR(24), reviewed_at FLOAT, created_at FLOAT);
+INSERT INTO challenge_submission SELECT
+  id, submission_id, run_id, challenge_id, version, player, stars, fuel_used,
+  elapsed_days, review_status, review_note, reviewed_by, reviewed_at, created_at
+  FROM _cs_old;
+DROP TABLE _cs_old;
+ALTER TABLE score_record RENAME TO _sr_old;
+CREATE TABLE score_record (
+  id INTEGER PRIMARY KEY, submission_id VARCHAR(64) NOT NULL UNIQUE,
+  run_id INTEGER, level_id INTEGER NOT NULL, stars INTEGER, fuel_used FLOAT,
+  elapsed_days FLOAT, source VARCHAR(16), created_at FLOAT);
+INSERT INTO score_record SELECT
+  id, submission_id, run_id, level_id, stars, fuel_used, elapsed_days,
+  source, created_at FROM _sr_old;
+DROP TABLE _sr_old;
+ALTER TABLE challenge_appeal RENAME TO _ca_old;
+CREATE TABLE challenge_appeal (
+  id INTEGER PRIMARY KEY, appeal_uid VARCHAR(64) NOT NULL UNIQUE,
+  submission_id INTEGER NOT NULL, round INTEGER, from_status VARCHAR(16),
+  player VARCHAR(24), reason VARCHAR(500), status VARCHAR(16),
+  decision_note VARCHAR(200), decided_by VARCHAR(24),
+  created_at FLOAT, decided_at FLOAT);
+INSERT INTO challenge_appeal SELECT
+  id, appeal_uid, submission_id, round, from_status, player, reason, status,
+  decision_note, decided_by, created_at, decided_at FROM _ca_old;
+DROP TABLE _ca_old;
+""")
+    conn.commit()
+    assert "uq_challenge_submission" not in {
+        x[1] for x in conn.execute("PRAGMA index_list(challenge_submission)")}
+    conn.close()
+
+    # 启动迁移
+    ch_svc.reset_bootstrap_for_tests()
+    db = SessionLocal()
+    ch_svc.bootstrap(db)
+    # 原数据保留
+    rec = db.query(ChallengeSubmission).filter_by(id=rid).one()
+    assert rec.submission_id == "legacy-key" and rec.challenge_id == d["id"]
+    db.close()
+
+    conn = sqlite3.connect(DB_PATH)
+    # 旧单列唯一自动索引摘除，换成命名复合唯一索引
+    idx = {x[1] for x in conn.execute(
+        "PRAGMA index_list(challenge_submission)")}
+    assert "uq_challenge_submission" in idx
+    assert "uq_level_submission" in {x[1] for x in conn.execute(
+        "PRAGMA index_list(score_record)")}
+    assert "uq_submission_appeal" in {x[1] for x in conn.execute(
+        "PRAGMA index_list(challenge_appeal)")}
+    # 迁移后跨挑战可复用同键（旧库结构下不可能）
+    other = _create(title="另一航线")
+    ro = _run(other["id"])
+    so = _submit(other["id"], ro["run_id"], "legacy-key")
+    assert so["record_id"] != rid and so["challenge_id"] == other["id"]
+    # 原挑战的同键重放仍幂等
+    again = _submit(d["id"], r["run_id"], "legacy-key")
+    assert again["duplicated"] and again["record_id"] == rid
+    conn.close()
+
+    # 迁移幂等：再次引导不重建、不报错
+    ch_svc.reset_bootstrap_for_tests()
+    db = SessionLocal()
+    ch_svc.bootstrap(db)
+    assert db.query(ChallengeSubmission).filter_by(id=rid).one().challenge_id == d["id"]
+    db.close()

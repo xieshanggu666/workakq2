@@ -133,6 +133,8 @@ def _error(e: Exception) -> HTTPException:
         return HTTPException(403, str(e))
     if isinstance(e, ch_svc.ChallengeLocked):
         return HTTPException(403, str(e))
+    if isinstance(e, ch_svc.IdempotencyConflict):
+        return HTTPException(409, str(e))
     if isinstance(e, (ch_svc.ReviewConflict, ch_svc.AppealConflict)):
         return HTTPException(409, str(e))
     if isinstance(e, ch_svc.ReviewerConflict):
@@ -198,7 +200,8 @@ def appeal_submission(record_id: int, req: AppealIn):
                 db, record_id=record_id, player=req.player,
                 reason=req.reason, appeal_id=req.appeal_id)
     except (ch_svc.SubmissionNotFound, ch_svc.ValidationError,
-            ch_svc.ForbiddenReviewer, ch_svc.AppealConflict) as e:
+            ch_svc.ForbiddenReviewer, ch_svc.AppealConflict,
+            ch_svc.IdempotencyConflict) as e:
         raise _error(e)
 
 
@@ -384,7 +387,8 @@ def submit(challenge_id: int, req: SubmitIn):
                                  run_id=req.run_id,
                                  submission_id=req.submission_id,
                                  player=req.player)
-    except (ch_svc.RunNotFound, ch_svc.RunChallengeMismatch) as e:
+    except (ch_svc.RunNotFound, ch_svc.RunChallengeMismatch,
+            ch_svc.IdempotencyConflict) as e:
         raise _error(e)
 
 

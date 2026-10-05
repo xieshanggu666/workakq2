@@ -111,6 +111,8 @@ def save_score(req: ScoreRequest):
         raise HTTPException(404, str(e))
     except scores_svc.RunLevelMismatch as e:
         raise HTTPException(400, str(e))
+    except scores_svc.IdempotencyConflict as e:
+        raise HTTPException(409, str(e))
 
 
 @router.get("/scores/{level_id}/records")

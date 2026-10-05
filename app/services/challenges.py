@@ -4,7 +4,10 @@
 - 版本化：每次发布生成不可变的 ChallengeVersion（预算 + 里程碑 + 时间限制），
   飞行记录与成绩都锚定具体版本；排行榜按版本结算，旧版本仍可查看与回放。
 - 幂等结算：/run 落库执行档案（ChallengeRun），/submit 以 submission_id 为幂等键
-  关联档案落库成绩；重复提交（双击/重试/多标签页）返回首个结果，不重复计数。
+  关联档案落库成绩；幂等键的作用域是单个挑战（数据库复合唯一约束
+  (challenge_id, submission_id) 兜底）：同一挑战内双击/重试/多标签页返回首个
+  结果，不重复计数；不同挑战各自独立，跨挑战复用同键不会把成绩、审核状态、
+  排行榜名次或回放串到别的挑战。
 - 审核联动：成绩默认 pending；审核通过（approved）后才进入排行榜、开放轨迹回放，
   并计入解锁条件。解锁状态按规则实时求值，审核通过即自动联动，无需额外迁移。
 - 申诉与复核：玩家可对 rejected/revoked 成绩凭 appeal_id 幂等键发起申诉（每成绩
@@ -94,6 +97,16 @@ class RunNotFound(KeyError):
 
 class RunChallengeMismatch(ValueError):
     """执行档案与提交的挑战不一致。"""
+
+
+class IdempotencyConflict(ValueError):
+    """幂等键在同一挑战内已被另一条飞行记录的提交占用（409）。
+
+    幂等键的作用域是"某挑战下的一次提交"：同键重放必须与首次提交指向
+    同一条执行档案；对另一条执行档案复用同键属客户端冲突，不能当作重放。
+    跨挑战复用同键互不影响（各自独立提交、审核、上榜与回放）。
+    申诉幂等键同理，作用域为单条成绩。
+    """
 
 
 class ChallengeLocked(PermissionError):
@@ -491,19 +504,14 @@ def submit(db, *, challenge_id: int, run_id: str, submission_id: Optional[str],
            player: Optional[str]) -> dict:
     """落库一条挑战成绩（默认待审核）。
 
-    幂等：submission_id 已存在时直接返回首个提交的结果（duplicated=True），
-    不重复落库、不重复进入审核队列。
+    幂等：同一挑战内 submission_id 已存在且指向同一条执行档案时直接返回
+    首个提交的结果（duplicated=True），不重复落库、不重复进入审核队列。
+    幂等键的作用域是"本挑战下的单次提交"——不同挑战复用同键互不影响
+    （各自独立提交、审核、上榜与回放）；同挑战内同键却换了一条执行档案
+    则抛 IdempotencyConflict(409)，不能把两次飞行并成一条成绩。
     """
     with _LOCK:
-        # 1) 幂等重放：同一提交已受理过 → 返回首个结果
-        if submission_id:
-            dup = (db.query(ChallengeSubmission)
-                     .filter(ChallengeSubmission.submission_id == submission_id)
-                     .first())
-            if dup is not None:
-                return _submitted_response(dup, duplicated=True)
-
-        # 2) 关联执行档案：成绩以服务端结算为准，且必须属于本挑战
+        # 1) 关联执行档案：成绩以服务端结算为准，且必须属于本挑战
         run = (db.query(ChallengeRun)
                  .filter(ChallengeRun.run_uid == run_id)
                  .first())
@@ -511,6 +519,20 @@ def submit(db, *, challenge_id: int, run_id: str, submission_id: Optional[str],
             raise RunNotFound(f"执行记录不存在: {run_id}")
         if run.challenge_id != challenge_id:
             raise RunChallengeMismatch("执行记录与挑战不匹配")
+
+        # 2) 幂等重放：同一挑战下同键且同一条执行档案 → 返回首个结果；
+        #    同键换了执行档案 → 冲突（不能把两次飞行并成一条成绩）
+        if submission_id:
+            dup = (db.query(ChallengeSubmission)
+                     .filter(ChallengeSubmission.challenge_id == challenge_id,
+                             ChallengeSubmission.submission_id == submission_id)
+                     .first())
+            if dup is not None:
+                if dup.run_id != run.id:
+                    raise IdempotencyConflict(
+                        "幂等键在本挑战已用于另一条飞行记录的提交，"
+                        "请为本次提交生成新的 submission_id")
+                return _submitted_response(dup, duplicated=True)
 
         # 3) 落库成绩记录（唯一约束兜底并发重复）
         rec = ChallengeSubmission(
@@ -530,9 +552,18 @@ def submit(db, *, challenge_id: int, run_id: str, submission_id: Optional[str],
             db.flush()
         except IntegrityError:
             db.rollback()
+            # 并发重放（双击/重试/多标签页同时到达）：以已落库的首条为准；
+            # 同挑战下键相同但执行档案不同 → 冲突，不能错返别的飞行记录
             dup = (db.query(ChallengeSubmission)
-                     .filter(ChallengeSubmission.submission_id == rec.submission_id)
+                     .filter(ChallengeSubmission.challenge_id == challenge_id,
+                             ChallengeSubmission.submission_id == rec.submission_id)
                      .first())
+            if dup is None:
+                raise
+            if dup.run_id != run.id:
+                raise IdempotencyConflict(
+                    "幂等键在本挑战已用于另一条飞行记录的提交，"
+                    "请为本次提交生成新的 submission_id")
             return _submitted_response(dup, duplicated=True)
         _add_event(db, rec, kind=EV_SUBMIT, actor=rec.player,
                    actor_role="player",
@@ -545,8 +576,73 @@ def submit(db, *, challenge_id: int, run_id: str, submission_id: Optional[str],
 
 # ---------- 审核权限 / 历史兼容 ----------
 
+# 旧库幂等键曾经是全局唯一，现改为"资源 + 键"复合唯一；迁移时按下表重建。
+# (表名, 作用域列, 幂等键列, 新复合唯一索引名)
+_SCOPED_KEY_TABLES = (
+    ("challenge_submission", "challenge_id", "submission_id", "uq_challenge_submission"),
+    ("score_record", "level_id", "submission_id", "uq_level_submission"),
+    ("challenge_appeal", "submission_id", "appeal_uid", "uq_submission_appeal"),
+)
+
+
+def _migrate_scoped_idempotency_keys(db) -> None:
+    """把旧库的"幂等键全局唯一"改成"资源 + 幂等键"复合唯一（SQLite 重建表）。
+
+    旧库中跨资源撞键的数据（正是导致成绩串挑战的脏数据）先按 (资源, 键)
+    去重，每组保留最早一条；随后按当前 ORM 模型重建表与索引。
+    """
+    from app.core.database import Base
+
+    bind = db.get_bind()
+    tables_meta = Base.metadata.tables
+    for table_name, scope_col, key_col, uq_index in _SCOPED_KEY_TABLES:
+        if table_name not in tables_meta:
+            continue
+        with bind.connect() as conn:
+            # 不重写其他表对本表的外键引用：重建后表名与主键均保持不变。
+            # pragma 是连接级设置，须在本连接内打开。
+            conn.exec_driver_sql("PRAGMA legacy_alter_table=ON")
+            exists = conn.exec_driver_sql(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table_name,)).fetchone()
+            if exists is None:
+                continue
+            indexes = {r[1] for r in conn.exec_driver_sql(
+                f"PRAGMA index_list({table_name})").fetchall()}
+            # 新库带有命名的复合唯一索引；旧库只有幂等键单列 UNIQUE（无该索引）
+            if uq_index in indexes:
+                continue
+            # 跨资源撞键的脏数据去重：每组保留最早一条
+            conn.exec_driver_sql(
+                f"DELETE FROM {table_name} WHERE id NOT IN "
+                f"(SELECT MIN(id) FROM {table_name} GROUP BY {scope_col}, {key_col})")
+            old_cols = [r[1] for r in conn.exec_driver_sql(
+                f"PRAGMA table_info({table_name})").fetchall()]
+            old_name = f"{table_name}__old"
+            conn.exec_driver_sql(f"ALTER TABLE {table_name} RENAME TO {old_name}")
+            # legacy 模式下旧表的命名索引不随表改名，先摘除（自动索引随旧表 DROP 消失）
+            for row in conn.exec_driver_sql(
+                    f"PRAGMA index_list({old_name})").fetchall():
+                idx_name = row[1]
+                if not idx_name.startswith("sqlite_autoindex"):
+                    conn.exec_driver_sql(f"DROP INDEX {idx_name}")
+            tables_meta[table_name].create(bind=conn)
+            new_cols = {r[1] for r in conn.exec_driver_sql(
+                f"PRAGMA table_info({table_name})").fetchall()}
+            keep = [c for c in old_cols if c in new_cols]
+            collist = ", ".join(keep)
+            conn.exec_driver_sql(
+                f"INSERT INTO {table_name} ({collist}) SELECT {collist} FROM {old_name}")
+            conn.exec_driver_sql(f"DROP TABLE {old_name}")
+            conn.commit()
+
+
 def _sqlite_migrate(db) -> None:
-    """对旧库做增量列迁移（SQLite ALTER TABLE ADD COLUMN，幂等）。"""
+    """对旧库做增量迁移（SQLite，幂等）：补列 + 幂等键作用域改为资源级。
+
+    使用独立连接完成 DDL（见 bootstrap 文档说明），迁移期间关闭外键约束，
+    重建被引用表后按原主键写回，引用关系保持一致。
+    """
     bind = db.get_bind()
     try:
         url = bind.url
@@ -554,9 +650,12 @@ def _sqlite_migrate(db) -> None:
         url = None
     if url is None or not str(url).startswith("sqlite"):
         return
+    # 让调用方会话的事务落地，避免与迁移连接的写锁互锁
+    db.commit()
     path = url.database
     conn = sqlite3.connect(path)
     try:
+        conn.execute("PRAGMA foreign_keys=OFF")
         cols = {r[1] for r in conn.execute(
             "PRAGMA table_info(challenge_submission)").fetchall()}
         if cols and "reviewed_by" not in cols:
@@ -565,6 +664,7 @@ def _sqlite_migrate(db) -> None:
             conn.commit()
     finally:
         conn.close()
+    _migrate_scoped_idempotency_keys(db)
 
 
 def _seed_reviewers(db) -> None:
@@ -906,14 +1006,15 @@ def create_appeal(db, *, record_id: int, player: str, reason: str,
     if len(reason) > MAX_APPEAL_REASON:
         raise ValidationError(f"申诉理由过长（≤{MAX_APPEAL_REASON} 字）")
     with _LOCK:
-        # 幂等重放：同一申诉已受理 → 返回首个结果
+        rec = _get_submission(db, record_id)
+        # 幂等重放：同一申诉已受理 → 返回首个结果（键的作用域为本成绩）
         if appeal_id:
             dup = (db.query(ChallengeAppeal)
-                     .filter(ChallengeAppeal.appeal_uid == appeal_id)
+                     .filter(ChallengeAppeal.submission_id == rec.id,
+                             ChallengeAppeal.appeal_uid == appeal_id)
                      .first())
             if dup is not None:
                 return _appeal_response(dup, duplicated=True)
-        rec = _get_submission(db, record_id)
         if rec.player != player:
             raise ForbiddenReviewer("只有提交该成绩的玩家本人可以申诉")
         if rec.review_status not in (REJECTED, REVOKED):
@@ -938,8 +1039,11 @@ def create_appeal(db, *, record_id: int, player: str, reason: str,
         except IntegrityError:
             db.rollback()
             dup = (db.query(ChallengeAppeal)
-                     .filter(ChallengeAppeal.appeal_uid == appeal.appeal_uid)
+                     .filter(ChallengeAppeal.submission_id == rec.id,
+                             ChallengeAppeal.appeal_uid == appeal.appeal_uid)
                      .first())
+            if dup is None:
+                raise
             return _appeal_response(dup, duplicated=True)
         # 成绩回到待复核队列；排行榜/回放/解锁因状态变化自动回滚
         rec.review_status = PENDING
