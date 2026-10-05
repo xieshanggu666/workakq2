@@ -1,0 +1,8 @@
+{
+  "name": "slingshot-game",
+  "version": "1.0.0",
+  "description": "引力跳板：星际弹弓轨道规划游戏",
+  "scripts": {
+  "dev": "mkdir -p data && rm -f data/flood.db && python scripts/calibrate.py && python -m uvicorn app.main:app --host 127.0.0.1 --port 8071"
+}
+}
